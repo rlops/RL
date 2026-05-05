@@ -329,6 +329,155 @@ class VllmInternalWorkerExtension:
 
         return True
 
+    def setup_collective_group(
+        self,
+        model_update_name: str,
+        comm_plan: dict[int, Any],
+        mode: str,
+        timeout_s: float | None = None,
+        dp_rank: int | None = None,
+    ) -> bool:
+        """Create a temporary RLix model-update NCCL group for this vLLM rank."""
+        del timeout_s  # StatelessProcessGroup does not expose timeout control.
+        from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
+
+        if len(comm_plan) != 1:
+            raise ValueError(
+                "RLix model-update receiver expects a single owner comm plan; "
+                f"got {len(comm_plan)} entries"
+            )
+        owner_plan = next(iter(comm_plan.values()))
+        local_rank = int(torch.distributed.get_rank())
+        rank = None
+        if mode == "sender":
+            rank = 0
+        else:
+            if dp_rank is None:
+                raise ValueError("dp_rank is required for receiver setup")
+            local_ranks = owner_plan.get("broadcast_local_ranks_by_dp_rank", {}).get(
+                int(dp_rank), []
+            )
+            if local_rank not in [int(x) for x in local_ranks]:
+                return True
+            devices = owner_plan.get("tgt_devices", [])
+            ordered = [
+                (int(item["rank"]), int(item["device"]))
+                for item in devices
+            ]
+            try:
+                rank = 1 + ordered.index((int(dp_rank), local_rank))
+            except ValueError:
+                return True
+
+        groups = getattr(self, "_rlix_model_update_groups", None)
+        if groups is None:
+            groups = {}
+            self._rlix_model_update_groups = groups
+        group = StatelessProcessGroup(
+            master_address=str(owner_plan["master_addr"]),
+            port=int(owner_plan["master_port"]),
+            rank=int(rank),
+            world_size=1 + len(owner_plan.get("tgt_devices", [])),
+        )
+        group.init_nccl_communicator(device=self.device)
+        groups[str(model_update_name)] = group
+        return True
+
+    def update_parameter_in_bucket(
+        self,
+        payload_list: list[Any],
+        is_lora: bool = False,
+        ipc_local_ranks: list[int] | None = None,
+        model_update_transport: str | None = None,
+    ) -> bool:
+        """Apply one IPC-delivered RLix weight bucket to selected local ranks."""
+        del is_lora, model_update_transport
+        local_rank = int(torch.distributed.get_rank())
+        if ipc_local_ranks is not None and local_rank not in [int(x) for x in ipc_local_ranks]:
+            return True
+        weights: list[tuple[str, torch.Tensor]] = []
+        for item in payload_list:
+            if isinstance(item, tuple) and len(item) == 2:
+                weights.append(item)
+            elif isinstance(item, dict):
+                name = item.get("name") or item.get("key")
+                tensor = item.get("tensor")
+                if tensor is None:
+                    tensor = item.get("value")
+                if name is not None and tensor is not None:
+                    weights.append((str(name), tensor))
+        policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        if fp8.is_fp8_model(self.model_runner.vllm_config):
+            fp8.load_weights(policy_weights, self.model_runner)
+        else:
+            self.model_runner.model.load_weights(weights=policy_weights)
+        self._load_draft_weights(draft_weights)
+        torch.cuda.current_stream().synchronize()
+        return True
+
+    def broadcast_parameter(
+        self,
+        group_name: str,
+        names: list[str],
+        dtypes: list[Any],
+        shapes: list[Any],
+        is_lora: bool = False,
+        broadcast_local_ranks: list[int] | None = None,
+    ) -> bool:
+        """Receive one RLix broadcast bucket and apply it to selected local ranks."""
+        del is_lora
+        local_rank = int(torch.distributed.get_rank())
+        if broadcast_local_ranks is not None and local_rank not in [int(x) for x in broadcast_local_ranks]:
+            return True
+        groups = getattr(self, "_rlix_model_update_groups", {})
+        group = groups.get(str(group_name))
+        if group is None:
+            raise RuntimeError(f"RLix model update group {group_name!r} is not initialized")
+        state_dict_info = {
+            str(name): (torch.Size(shape), dtype)
+            for name, dtype, shape in zip(names, dtypes, shapes)
+        }
+
+        def _load(weights: list[tuple[str, torch.Tensor]]) -> None:
+            self.update_parameter_in_bucket(weights)
+
+        packed_broadcast_consumer(
+            iterator=iter(state_dict_info.items()),
+            group=group,
+            src=0,
+            post_unpack_func=_load,
+        )
+        return True
+
+    def destroy_collective_group(self, group_name: str) -> bool:
+        """Destroy a temporary RLix model-update group if this rank joined it."""
+        groups = getattr(self, "_rlix_model_update_groups", None)
+        if not groups:
+            return True
+        groups.pop(str(group_name), None)
+        gc.collect()
+        torch.cuda.empty_cache()
+        return True
+
+    def verify_model(self, expected_stats: dict[str, Any]) -> bool:
+        """Receiver API placeholder for RLix checksum verification."""
+        del expected_stats
+        return True
+
+    def finalize_weight_update(self) -> bool:
+        """Run vLLM post-load hooks once after all RLix buckets are applied."""
+        from vllm.model_executor.model_loader.utils import process_weights_after_loading
+
+        process_weights_after_loading(
+            self.model_runner.model, self.model_config, self.device
+        )
+        self._maybe_process_fp8_kv_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
+        return True
+
     def cleanup(self) -> None:
         """Shutdown and cleanup resources."""
         # Close ZMQ socket and context if they exist

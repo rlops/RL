@@ -968,6 +968,11 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             traceback.print_exc()
             return False
 
+    def rlix_model_update_rpc(self, method_name: str, *args: Any) -> bool:
+        """Forward an RLix model-update method to vLLM internal workers."""
+        result = self.llm.collective_rpc(method_name, args=args)
+        return all(bool(x) for x in result)
+
     def reset_prefix_cache(self):
         """Reset the prefix cache of vLLM engine."""
         assert self.llm is not None, (

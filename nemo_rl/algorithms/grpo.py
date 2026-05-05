@@ -2380,6 +2380,7 @@ def async_grpo_train(
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
     max_trajectory_age_steps: int = 1,
+    rlix_hooks: Optional[Any] = None,
 ) -> None:
     """Run asynchronous GRPO training with replay buffer.
 
@@ -2398,6 +2399,17 @@ def async_grpo_train(
         master_config: Master configuration
         max_trajectory_age_steps: Maximum age (in training steps) for trajectories to be used in training
     """
+    # F5/F11: RLix integration flag.
+    # True when RLIX_CONTROL_PLANE=rlix env var is set; False in standalone mode.
+    # Controls: skip standalone refit, enable before/after_training hooks, and
+    # skip prepare_for_generation() / refit_policy_generation() which conflict
+    # with scheduler-driven sleep/wake.
+    DO_TIME_SHARING: bool = os.environ.get("RLIX_CONTROL_PLANE") == "rlix"
+
+    # F5/F9: Resolve hooks — use injected real implementation or no-op default.
+    from nemo_rl.algorithms.rlix_hooks import NoOpRLixHooks, RLixHooksProtocol
+    hooks: RLixHooksProtocol = rlix_hooks if rlix_hooks is not None else NoOpRLixHooks()
+
     # Ensure we are running with a compatible async generation backend
     assert _should_use_async_rollouts(master_config), (
         "Async GRPO requires vLLM backend with vllm_cfg.async_engine=True. "
@@ -2519,7 +2531,10 @@ def async_grpo_train(
         },
     }
 
+    nccl_state_snapshot: dict[str, Any] | None = None
+
     # Initialize trajectory collector with synchronized collection
+    # F9: Pass rlix_hooks so ATC can call end_progress_batch after each push.
     trajectory_collector = AsyncTrajectoryCollector.options(
         runtime_env=_tc_runtime_env
     ).remote(
@@ -2529,13 +2544,23 @@ def async_grpo_train(
         master_config=master_config,
         replay_buffer=replay_buffer,
         start_step=step,
+        rlix_hooks=hooks,
     )
-
-    # Start trajectory collection in background
-    collection_task = trajectory_collector.start_collection.remote(dataloader)
 
     # Ensure collector knows initial weight version
     trajectory_collector.set_weight_version.remote(weight_version)
+
+    # F6: Register collector handle with pipeline actor so _expand_workers can
+    # call set_weight_version after each selective sync (before routing activation).
+    hooks.on_trajectory_collector_created(trajectory_collector)
+
+    # F9: Progress begin/end state lives in the collector actor because that is
+    # where per-push reports are emitted. Open the first stream before
+    # collection starts.
+    ray.get(trajectory_collector.begin_progress_batch.remote(step, num_prompts_per_step))
+
+    # Start trajectory collection in background
+    collection_task = trajectory_collector.start_collection.remote(dataloader)
 
     print("📦 Started continuous background trajectory collection")
 
@@ -2544,29 +2569,33 @@ def async_grpo_train(
     )
 
     print("⏳ Preparing policy generation for training...")
-    if NEED_REFIT and POLICY_GENERATION_STALE:
-        print("🔄 Refitting policy generation with actual model weights...")
-        try:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
-            print("✅ Policy generation refit completed successfully")
-            POLICY_GENERATION_STALE = False
-        except Exception as e:
-            print(f"❌ Policy generation refit failed: {e}")
-            import traceback
+    # F5/F11: In RLix mode, skip initial refit and prepare_for_generation.
+    # Weights are synced on first scheduler expand; sleep/wake is scheduler-driven.
+    # Calling prepare_for_generation here would reinitialize already-running inference workers.
+    if not DO_TIME_SHARING:
+        if NEED_REFIT and POLICY_GENERATION_STALE:
+            print("🔄 Refitting policy generation with actual model weights...")
+            try:
+                refit_policy_generation(policy, policy_generation, colocated_inference)
+                print("✅ Policy generation refit completed successfully")
+                POLICY_GENERATION_STALE = False
+            except Exception as e:
+                print(f"❌ Policy generation refit failed: {e}")
+                import traceback
 
-            traceback.print_exc()
-            return
-    else:
-        print("🔄 Preparing policy generation for inference...")
-        try:
-            policy_generation.prepare_for_generation()
-            print("✅ Policy generation preparation completed successfully")
-        except Exception as e:
-            print(f"❌ Policy generation preparation failed: {e}")
-            import traceback
+                traceback.print_exc()
+                return
+        else:
+            print("🔄 Preparing policy generation for inference...")
+            try:
+                policy_generation.prepare_for_generation()
+                print("✅ Policy generation preparation completed successfully")
+            except Exception as e:
+                print(f"❌ Policy generation preparation failed: {e}")
+                import traceback
 
-            traceback.print_exc()
-            return
+                traceback.print_exc()
+                return
 
     print("✅ Policy generation setup complete, proceeding to validation...")
 
@@ -2786,6 +2815,17 @@ def async_grpo_train(
 
                 # Training phase (same as sync version)
                 print("▶ Preparing for logprob inference...")
+                # F5: Block until scheduler grants actor_train GPUs.
+                # In RLix mode: scheduler asynchronously shrinks overlap inference
+                # workers before returning.  In standalone mode: no-op.
+                hooks.before_training(step)
+                if DO_TIME_SHARING and nccl_state_snapshot:
+                    from nemo_rl.models.megatron.nccl_offload import (
+                        reload_megatron_nccl_groups,
+                    )
+
+                    reload_megatron_nccl_groups(nccl_state_snapshot)
+                    nccl_state_snapshot = None
                 with timer.time("logprob_inference_prep"):
                     policy.prepare_for_lp_inference()
 
@@ -2857,7 +2897,44 @@ def async_grpo_train(
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None
-                if NEED_REFIT:
+                if DO_TIME_SHARING:
+                    # F5/F11: RLix mode — replace standalone refit with scheduler-
+                    # driven expand.  The scheduler's resize_infer(add=overlap_ranks)
+                    # calls pipeline._expand_workers() which does the atomic
+                    # wake + selective sync + version update + routing activation (F6).
+                    #
+                    with timer.time("weight_sync"):
+                        # F11: PR #4 owns the Megatron NCCL destroy/reload
+                        # implementation. This branch only invokes it after
+                        # NeMo has offloaded training-side state.
+                        policy.offload_after_refit()
+                        from nemo_rl.models.megatron.nccl_offload import (
+                            destroy_megatron_nccl_groups,
+                        )
+
+                        nccl_stats = destroy_megatron_nccl_groups()
+                        nccl_state_snapshot = nccl_stats.get("state_snapshot") or None
+
+                        # Notify scheduler: actor_train GPUs are free.
+                        # Scheduler asynchronously triggers expand + weight sync.
+                        published_version = hooks.after_training(step)
+                        # RLix publishes version=cache_ready_step after active
+                        # refresh completes. Fall back to step for older hooks.
+                        weight_version = (
+                            int(published_version)
+                            if published_version is not None
+                            else int(step)
+                        )
+                        next_progress_step = step + 1
+                        if next_progress_step < master_config["grpo"]["max_num_steps"]:
+                            ray.get(
+                                trajectory_collector.begin_progress_batch.remote(
+                                    next_progress_step, num_prompts_per_step
+                                )
+                            )
+                        POLICY_GENERATION_STALE = False
+                elif NEED_REFIT:
+                    # Standalone mode — original refit path.
                     # Measure pending-generation wait as exposed_generation time
                     print("🔄 Coordinating with trajectory collector before refit...")
                     with timer.time("exposed_generation"):
@@ -2898,13 +2975,14 @@ def async_grpo_train(
                     # Pause trajectory collection during validation to reduce memory pressure
                     trajectory_collector.pause.remote()
 
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
-                        refit_policy_generation(
-                            policy, policy_generation, colocated_inference
-                        )
-                        POLICY_GENERATION_STALE = False
-                    else:
-                        policy_generation.prepare_for_generation()
+                    if not DO_TIME_SHARING:
+                        if NEED_REFIT and POLICY_GENERATION_STALE:
+                            refit_policy_generation(
+                                policy, policy_generation, colocated_inference
+                            )
+                            POLICY_GENERATION_STALE = False
+                        else:
+                            policy_generation.prepare_for_generation()
                     val_metrics, validation_timings = validate(
                         policy_generation,
                         val_dataloader,

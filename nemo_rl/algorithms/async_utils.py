@@ -99,6 +99,15 @@ class ReplayBuffer:
         with self._lock:
             return set(self.target_weight_versions)
 
+    def count_target_weight(self, target_weight_version: int) -> int:
+        """Return buffered prompt groups intended for one training step."""
+        with self._lock:
+            return sum(
+                1
+                for version in self.target_weight_versions
+                if version == target_weight_version
+            )
+
     def sample(
         self,
         num_prompt_groups: int,
@@ -247,6 +256,7 @@ class AsyncTrajectoryCollector:
         master_config: MasterConfig,
         replay_buffer: Any,
         start_step: int = 0,
+        rlix_hooks: Any = None,
     ):
         self.policy_generation = policy_generation
         self.tokenizer = tokenizer
@@ -254,6 +264,17 @@ class AsyncTrajectoryCollector:
         self.master_config = master_config
         self.replay_buffer = replay_buffer
         self.running = False
+
+        # F9: Optional RLix hooks for progress reporting.
+        # When provided, begin/end_progress_batch is driven inside this actor so
+        # local hook state is consistent with per-push reports.
+        # Defaults to NoOpRLixHooks so standalone runs need not pass anything.
+        if rlix_hooks is None:
+            from nemo_rl.algorithms.rlix_hooks import NoOpRLixHooks
+
+            rlix_hooks = NoOpRLixHooks()
+        self._rlix_hooks = rlix_hooks
+        self._rlix_progress_step: Optional[int] = None
 
         self._pg_lock: _threading.Lock = _threading.Lock()
 
@@ -351,6 +372,19 @@ class AsyncTrajectoryCollector:
             print(f"🔄 Updated weight version to {version}, resuming collection")
         else:
             print(f"🔄 Updated weight version to {version}")
+
+    def begin_progress_batch(self, step: int, count_intended: int) -> None:
+        """Start reporting progress for the training step RLix is scheduling.
+
+        The collector may generate future-targeted trajectories. Only the
+        active progress step is reported so hook implementations with local
+        begin/end state do not see mismatched target versions.
+        """
+        self._rlix_progress_step = step
+        self._rlix_hooks.begin_progress_batch(step, count_intended)
+        already_buffered = ray.get(self.replay_buffer.count_target_weight.remote(step))
+        if already_buffered:
+            self._rlix_hooks.end_progress_batch(step, already_buffered)
 
     def _should_pause_for_generation_limits(self) -> bool:
         """Check if collection should be paused due to generation limits."""
@@ -702,6 +736,15 @@ class AsyncTrajectoryCollector:
                         print(
                             f"📦 Buffered per-prompt group (prompt_idx {prompt_idx}, target_weight {target_weight_version})"
                         )
+
+                        # F9: Report only the target step currently being
+                        # scheduled. Future-targeted trajectories are counted
+                        # when that step becomes active, including a catch-up
+                        # count in begin_progress_batch().
+                        if target_weight_version == self._rlix_progress_step:
+                            self._rlix_hooks.end_progress_batch(
+                                target_weight_version, repeated_batch.size
+                            )
 
                         # Release reservation when FIRST prompt group for this target is successfully buffered
                         if prompt_idx == 0:

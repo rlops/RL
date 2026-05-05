@@ -17,6 +17,7 @@ import os
 import threading
 import warnings
 from collections import defaultdict
+from types import SimpleNamespace
 from typing import (
     Any,
     AsyncGenerator,
@@ -1080,6 +1081,43 @@ class VllmGeneration(GenerationInterface):
         )
 
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
+        return futures
+
+    def get_model_update_receiver(self) -> Any:
+        """Expose a cluster-like receiver surface for RLix selective sync."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        rank2worker = {
+            dp_rank: self.worker_group.workers[
+                self.worker_group.get_dp_leader_worker_idx(dp_rank)
+            ]
+            for dp_rank in range(self.worker_group.dp_size)
+        }
+        worker_config = SimpleNamespace(
+            device_mapping=getattr(self, "_rlix_device_mapping", None),
+            num_gpus_per_worker=self.cfg["vllm_cfg"]["tensor_parallel_size"],
+        )
+        return SimpleNamespace(
+            workers=list(self.worker_group.workers),
+            rank2worker=rank2worker,
+            worker_config=worker_config,
+        )
+
+    def finalize_weight_update(self, dp_ranks: list[int]) -> list[ray.ObjectRef]:
+        """Run post-load hooks once on selected DP workers after RLix bucket sync."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        futures: list[ray.ObjectRef] = []
+        for dp_rank in sorted(set(int(rank) for rank in dp_ranks)):
+            worker_idx = self.worker_group.get_dp_leader_worker_idx(dp_rank)
+            futures.append(
+                self.worker_group.run_single_worker_single_data(
+                    "rlix_model_update_rpc",
+                    worker_idx=worker_idx,
+                    method_name="finalize_weight_update",
+                )
+            )
         return futures
 
     def start_gpu_profiling(self) -> None:

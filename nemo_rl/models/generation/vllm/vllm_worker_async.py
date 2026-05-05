@@ -1117,6 +1117,15 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             traceback.print_exc()
             return False
 
+    async def rlix_model_update_rpc(self, method_name: str, *args: Any) -> bool:
+        """Forward an RLix model-update method to vLLM internal workers."""
+        result_or_coro = await self.llm.collective_rpc(method_name, args=args)
+        if asyncio.iscoroutine(result_or_coro):
+            result = await result_or_coro
+        else:
+            result = result_or_coro
+        return all(bool(x) for x in result)
+
     async def reset_prefix_cache_async(self):
         """Async version of reset_prefix_cache."""
         assert self.llm is not None, (
