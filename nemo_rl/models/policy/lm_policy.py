@@ -932,6 +932,38 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("offload_after_refit")
         ray.get(futures)
 
+    def build_cpu_bucket_cache(self, checkpoint_version: int) -> None:
+        """Build and promote the RLix CPU bucket cache on Megatron workers."""
+        if not self.cfg.get("megatron_cfg", {}).get("enabled", False):
+            raise NotImplementedError(
+                "RLix CPU bucket cache is only implemented for Megatron policy workers."
+            )
+        futures = self.worker_group.run_all_workers_single_data(
+            "build_latest_bucket_cache",
+            checkpoint_version=int(checkpoint_version),
+        )
+        ray.get(futures)
+        futures = self.worker_group.run_all_workers_single_data(
+            "promote_active_checkpoint",
+            version=int(checkpoint_version),
+        )
+        ray.get(futures)
+
+    def offload_training_gpu(self) -> None:
+        """Release training-side GPU state for RLix scheduler-driven inference."""
+        self.offload_after_refit()
+
+    def destroy_nccl_groups(self) -> dict[str, Any]:
+        """Destroy Megatron NCCL groups inside the worker processes."""
+        if not self.cfg.get("megatron_cfg", {}).get("enabled", False):
+            return {}
+        futures = self.worker_group.run_all_workers_single_data("destroy_nccl_groups")
+        results = ray.get(futures)
+        for result in results:
+            if isinstance(result, dict) and result.get("state_snapshot"):
+                return result
+        return results[0] if results else {}
+
     def save_checkpoint(
         self,
         weights_path: str,

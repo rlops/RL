@@ -1620,6 +1620,12 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         )
         no_grad.__exit__(None, None, None)
 
+    def destroy_nccl_groups(self):
+        """Release Megatron NCCL communicator buffers owned by this worker."""
+        from nemo_rl.models.megatron.nccl_offload import destroy_megatron_nccl_groups
+
+        return destroy_megatron_nccl_groups()
+
     @torch.no_grad()
     def move_model(
         self,

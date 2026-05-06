@@ -956,6 +956,28 @@ class VllmGeneration(GenerationInterface):
         with self._active_dp_ranks_lock:
             self._active_dp_ranks.update(dp_ranks)
 
+    def sleep_all(self, level: int | None = None, mode: str = "abort") -> bool:
+        """Sleep every DP shard and remove all ranks from routing."""
+        if self.cfg["colocated"]["enabled"]:
+            return self.finish_generation()
+
+        method_name = (
+            "sleep_async" if self.cfg["vllm_cfg"]["async_engine"] else "sleep"
+        )
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name,
+            level=level,
+            mode=mode,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        results = ray.get(futures)
+        ok = all(result for result in results if result is not None)
+        if ok:
+            with self._active_dp_ranks_lock:
+                self._active_dp_ranks.clear()
+            self._mark_preempted_dp_ranks(list(range(self.worker_group.dp_size)))
+        return ok
+
     async def generate_text_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:

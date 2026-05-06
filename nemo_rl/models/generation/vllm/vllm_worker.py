@@ -973,6 +973,64 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         result = self.llm.collective_rpc(method_name, args=args)
         return all(bool(x) for x in result)
 
+    def setup_collective_group(
+        self,
+        model_update_name: str,
+        comm_plan: dict,
+        mode: str,
+        timeout_s: float | None = None,
+    ) -> bool:
+        return self.rlix_model_update_rpc(
+            "setup_collective_group",
+            model_update_name,
+            comm_plan,
+            mode,
+            timeout_s,
+        )
+
+    def update_parameter_in_bucket(
+        self,
+        payload: dict,
+        ipc_local_ranks: list[int],
+        model_update_transport: str,
+        is_lora: bool = False,
+    ) -> bool:
+        return self.rlix_model_update_rpc(
+            "update_parameter_in_bucket",
+            payload,
+            ipc_local_ranks,
+            model_update_transport,
+            is_lora,
+        )
+
+    def broadcast_parameter(
+        self,
+        group_name: str,
+        names: list[str],
+        dtypes: list,
+        shapes: list,
+        broadcast_local_ranks: list[int],
+        is_lora: bool = False,
+    ) -> bool:
+        return self.rlix_model_update_rpc(
+            "broadcast_parameter",
+            group_name,
+            names,
+            dtypes,
+            shapes,
+            broadcast_local_ranks,
+            is_lora,
+        )
+
+    def destroy_collective_group(self, group_name: str) -> bool:
+        return self.rlix_model_update_rpc("destroy_collective_group", group_name)
+
+    def verify_model(self, expected_stats: dict) -> bool:
+        return self.rlix_model_update_rpc("verify_model", expected_stats)
+
+    def finalize_weight_update(self) -> bool:
+        return self.rlix_model_update_rpc("finalize_weight_update")
+
     def reset_prefix_cache(self):
         """Reset the prefix cache of vLLM engine."""
         assert self.llm is not None, (
