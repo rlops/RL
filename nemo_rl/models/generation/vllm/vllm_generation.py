@@ -1351,6 +1351,17 @@ class VllmGeneration(GenerationInterface):
         """Get logger metrics for performance reporting."""
         return self.get_vllm_logger_metrics()
 
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        state.pop("_active_dp_ranks_lock", None)
+        state.pop("_preempted_dp_ranks_lock", None)
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._active_dp_ranks_lock = threading.Lock()
+        self._preempted_dp_ranks_lock = threading.Lock()
+
     def __del__(self) -> None:
         """Shuts down the worker groups when the object is deleted or is garbage collected.
 
