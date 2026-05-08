@@ -176,6 +176,25 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         # Validate configuration
         self.megatron_cfg.validate()
 
+        # RLix timesharing: disable TE precision-aware optimizer.
+        # When RLIX_CONTROL_PLANE=rlix the training worker cycles through
+        # offload_after_refit() + prepare_for_training() between steps.
+        # TE FusedAdam with use_precision_aware_optimizer=True caches raw
+        # GPU data_ptr() for its FP32 master weights in C++ state; after
+        # offload/reload those addresses are stale -> cudaErrorIllegalAddress.
+        # Disabling precision-aware mode removes C++ master-weight caching;
+        # exp_avg/exp_avg_sq remain plain PyTorch tensors and move correctly.
+        import os as _os
+        if _os.environ.get("RLIX_CONTROL_PLANE") == "rlix":
+            _opt_cfg = config.get("megatron_cfg", {}).get("optimizer", {})
+            if _opt_cfg.get("use_precision_aware_optimizer", False):
+                _opt_cfg["use_precision_aware_optimizer"] = False
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "RLIX timesharing: forcing use_precision_aware_optimizer=False "
+                    "to avoid TE FusedAdam C++ pointer staleness after CPU offload/reload."
+                )
+
         # Step 4: Setup Megatron model and components
         model_and_optimizer_state = setup_model_and_optimizer(
             config, self.megatron_cfg, init_optimizer
@@ -1558,15 +1577,24 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         )
         self.model.train()
 
-        # Move optimizer state to CUDA if it exists
-        # colocated generation will always offload optimizer to cuda before refit
-        if (
+        # Move optimizer state to CUDA if it exists.
+        # colocated generation will always offload optimizer to cuda before refit.
+        # _optimizer_offloaded_for_timesharing is set by offload_after_refit() in
+        # the DO_TIME_SHARING path (RLIX_CONTROL_PLANE=rlix) where the optimizer is
+        # always offloaded regardless of offload_optimizer_for_logprob.
+        should_reload_optimizer = (
             hasattr(self, "optimizer")
             and self.optimizer is not None
             and not self.optimizer_cpu_offload
-            and (self.offload_optimizer_for_logprob or self.is_generation_colocated)
-        ):
+            and (
+                self.offload_optimizer_for_logprob
+                or self.is_generation_colocated
+                or getattr(self, "_optimizer_offloaded_for_timesharing", False)
+            )
+        )
+        if should_reload_optimizer:
             self.move_optimizer("cuda")
+            self._optimizer_offloaded_for_timesharing = False
 
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
             torch.cuda.empty_cache()
@@ -1612,6 +1640,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         self.model.eval()
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()  # rerun the old offload function
+        self._optimizer_offloaded_for_timesharing = True
 
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB

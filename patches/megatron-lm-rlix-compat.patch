@@ -1,0 +1,70 @@
+diff --git a/megatron/core/dist_checkpointing/serialization.py b/megatron/core/dist_checkpointing/serialization.py
+index a0426ec..e04400b 100644
+--- a/megatron/core/dist_checkpointing/serialization.py
++++ b/megatron/core/dist_checkpointing/serialization.py
+@@ -296,7 +296,7 @@ def save(
+         Callable[[CommonStateDict], StateDict]
+     ] = None,
+     content_metadata: Optional[dict] = None,
+-    async_strategy: Optional[str] = "nvrx",
++    async_strategy: Optional[str] = "mcore",
+ ) -> Optional[AsyncRequest]:
+     """Saving entrypoint.
+ 
+diff --git a/megatron/core/dist_checkpointing/strategies/torch.py b/megatron/core/dist_checkpointing/strategies/torch.py
+index 000aa4d..ade3d81 100644
+--- a/megatron/core/dist_checkpointing/strategies/torch.py
++++ b/megatron/core/dist_checkpointing/strategies/torch.py
+@@ -658,7 +658,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
+         self,
+         sharded_state_dict: ShardedStateDict,
+         checkpoint_dir: Path,
+-        async_strategy: str = "nvrx",
++        async_strategy: str = "mcore",
+     ) -> AsyncRequest | NVRxAsyncRequest:
+         """Translates MCore ShardedTensors to PyT ShardedTensors & saves in PyT Distributed format.
+ 
+@@ -835,7 +835,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
+         self,
+         sharded_state_dict: ShardedStateDict,
+         checkpoint_dir: Path,
+-        async_strategy: str = "nvrx",
++        async_strategy: str = "mcore",
+     ) -> StateDict:
+         """Translates MCore ShardedTensors to PyT ShardedTensors & loads from PyT Distributed fmt.
+ 
+@@ -1037,7 +1037,7 @@ def get_async_strategy(async_strategy: str = "nvrx", module: str = None) -> tupl
+             from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
+                 FileSystemWriterAsync,
+                 _results_queue,
+-                get_write_results_queue,
++                _get_write_results_queue as get_write_results_queue,
+             )
+             from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
+                 CheckpointMetadataCache,
+diff --git a/megatron/core/extensions/transformer_engine.py b/megatron/core/extensions/transformer_engine.py
+index c2817cf..e05ccf3 100644
+--- a/megatron/core/extensions/transformer_engine.py
++++ b/megatron/core/extensions/transformer_engine.py
+@@ -2557,7 +2557,7 @@ try:
+         retain_pinned_cpu_buffers,
+     ):
+         """Get CPU offload context and sync function."""
+-        if is_te_min_version("2.5.0"):
++        if is_te_min_version("2.5.0") and not is_te_min_version("2.8.0"):
+             # Enables the additional double buffering switch for activations during LLM training
+             context, sync_func = _get_cpu_offload_context(
+                 enabled,
+diff --git a/megatron/core/optimizer/__init__.py b/megatron/core/optimizer/__init__.py
+index ce9bb2d..817f1f2 100644
+--- a/megatron/core/optimizer/__init__.py
++++ b/megatron/core/optimizer/__init__.py
+@@ -544,7 +544,7 @@ def _get_megatron_optimizer_based_on_param_groups(
+                 kwargs["adam_w_mode"] = config.decoupled_weight_decay
+                 adam_cls = Adam
+ 
+-            if config.use_precision_aware_optimizer:
++            if config.use_precision_aware_optimizer and not USING_PYTORCH_OPTIMIZER:
+                 kwargs.update(
+                     {
+                         "exp_avg_dtype": config.exp_avg_dtype,
