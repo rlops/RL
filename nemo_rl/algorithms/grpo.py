@@ -2959,7 +2959,7 @@ def async_grpo_train(
                         weight_version = (
                             int(published_version)
                             if published_version is not None
-                            else int(step)
+                            else weight_version + 1
                         )
                         next_progress_step = step + 1
                         if next_progress_step < master_config["grpo"]["max_num_steps"]:
@@ -2968,6 +2968,7 @@ def async_grpo_train(
                                     next_progress_step, num_prompts_per_step
                                 )
                             )
+                        trajectory_collector.set_weight_version.remote(weight_version)
                         POLICY_GENERATION_STALE = False
                 elif NEED_REFIT:
                     # Standalone mode — original refit path.
