@@ -118,7 +118,16 @@ class AbstractPolicyWorker:
     def report_node_ip_and_gpu_id(self) -> tuple[str, int]:
         """Report the node IP and GPU ID of the current worker."""
         ip = ray._private.services.get_node_ip_address()
-        gpu_id = ray.get_gpu_ids()[0]
+        gpu_ids = ray.get_gpu_ids()
+        if gpu_ids:
+            gpu_id = gpu_ids[0]
+        else:
+            # RLix smoke-test path: num_gpus=0 → ray.get_gpu_ids() is empty.
+            # Derive the physical GPU id from the worker's CUDA_VISIBLE_DEVICES,
+            # which the RLix-mode worker_groups.py path pins per bundle.
+            import os as _os
+            cvd = _os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            gpu_id = int(cvd.split(",")[0]) if cvd else 0
         return (ip, gpu_id)
 
     # Temporary fix, 'data' is a kwarg due to some sort of ray bug

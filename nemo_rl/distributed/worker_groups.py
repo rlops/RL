@@ -389,10 +389,24 @@ class RayWorkerGroup:
                         f"but {worker_count} workers were requested"
                     )
 
-                for bundle_idx in range(worker_count):
-                    # Each worker is its own single-element group
-                    # The first element is the PG index (node_idx in the context of tied workers)
-                    bundle_indices_list.append((i, [bundle_idx]))
+                # RLix smoke test (2 GPU / 2 ppl): when the cluster carries an
+                # explicit device_mapping (set by RLixVirtualClusterAdapter), pin
+                # this cluster's workers to those exact bundle indices instead of
+                # the default 0..worker_count-1 range. Lets per-pipeline clusters
+                # share a singleton PG while still landing on disjoint bundles.
+                rlix_device_mapping = getattr(self.cluster, "device_mapping", None)
+                if (
+                    os.environ.get("RLIX_CONTROL_PLANE") == "rlix"
+                    and rlix_device_mapping
+                    and len(placement_groups) == 1
+                ):
+                    for bundle_idx in rlix_device_mapping:
+                        bundle_indices_list.append((i, [int(bundle_idx)]))
+                else:
+                    for bundle_idx in range(worker_count):
+                        # Each worker is its own single-element group
+                        # The first element is the PG index (node_idx in the context of tied workers)
+                        bundle_indices_list.append((i, [bundle_idx]))
 
         # Create workers based on the bundle_indices_list
         self._create_workers_from_bundle_indices(
@@ -519,12 +533,29 @@ class RayWorkerGroup:
                     else f"{self.name_prefix}-{pg_idx}-{bundle_idx}"
                 )
 
-                # Calculate GPU resources
-                num_gpus = (
-                    1 / self.cluster.max_colocated_worker_groups
-                    if self.cluster.use_gpus
-                    else 0
-                )
+                # Calculate GPU resources.
+                # RLix smoke-test path: under RLIX_CONTROL_PLANE=rlix:
+                #   - num_gpus=0: Ray reserves no GPU resource → Ray's
+                #     ``assigned_ids`` set is empty → the IndexError path in
+                #     ``get_accelerator_ids_for_accelerator_resource``
+                #     (assigned_ids contains an index >= len(original_ids))
+                #     is fully bypassed (empty set comprehension).
+                #   - NOSET=1: Ray does not touch CUDA_VISIBLE_DEVICES.
+                #   - CUDA_VISIBLE_DEVICES=str(bundle_idx): pin each worker to
+                #     exactly its assigned physical GPU. With assigned_ids
+                #     empty (num_gpus=0), the per-worker single-value
+                #     CUDA_VISIBLE_DEVICES is safe — the IndexError path is
+                #     guarded by ``if assigned_ids`` being non-empty.
+                if self.cluster.use_gpus and os.environ.get("RLIX_CONTROL_PLANE") == "rlix":
+                    num_gpus = 0
+                    worker_env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
+                    worker_env_vars["CUDA_VISIBLE_DEVICES"] = str(bundle_idx)
+                else:
+                    num_gpus = (
+                        1 / self.cluster.max_colocated_worker_groups
+                        if self.cluster.use_gpus
+                        else 0
+                    )
 
                 # Pass these options to the remote_worker_builder
                 runtime_env = {
