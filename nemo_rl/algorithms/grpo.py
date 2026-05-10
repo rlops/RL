@@ -2519,9 +2519,21 @@ def async_grpo_train(
         },
     }
 
+    # Register trajectory collector as a named Ray actor so the rlix pipeline can
+    # look it up for set_weight_version calls (spec: nemorl-port-plan.md lines 490, 538, 603).
+    _rlix_pipeline_id = os.environ.get("PIPELINE_ID", "")
+    _rlix_ray_namespace = os.environ.get("ROLL_RAY_NAMESPACE", "")
+    _tc_name = (
+        f"rlix:trajectory_collector:{_rlix_pipeline_id}"
+        if _rlix_pipeline_id
+        else None
+    )
+    _tc_namespace = _rlix_ray_namespace if _rlix_ray_namespace else None
+
     # Initialize trajectory collector with synchronized collection
     trajectory_collector = AsyncTrajectoryCollector.options(
-        runtime_env=_tc_runtime_env
+        runtime_env=_tc_runtime_env,
+        **({"name": _tc_name, "namespace": _tc_namespace} if _tc_name else {}),
     ).remote(
         policy_generation=policy_generation,
         tokenizer=tokenizer,

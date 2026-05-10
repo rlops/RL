@@ -1082,6 +1082,122 @@ class VllmGeneration(GenerationInterface):
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
+    # ------------------------------------------------------------------
+    # rlix integration: selective sync receiver pass-throughs (Feature 4)
+    # ------------------------------------------------------------------
+    #
+    # Every receiver pass-through below MUST dispatch to ALL TP/PP ranks
+    # (run_rank_0_only_axes=[]). NCCL collectives require every
+    # participating rank to call init_process_group / join the group; if
+    # we filter to TP rank 0 only, ranks 1..N-1 never join → all
+    # subsequent collectives (broadcast, finalize) deadlock or assert.
+
+    def setup_collective_group(
+        self,
+        model_update_name: str,
+        comm_plan: dict,
+        mode: str,
+        timeout_s: float | None = None,
+    ) -> None:
+        """Pass-through: join NCCL group on all infer workers.
+
+        Awaits sub-worker futures before returning so the caller's ray.get()
+        correctly barriers on completion (spec: nemorl-port-plan.md phase barriers).
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "setup_collective_group",
+            model_update_name=model_update_name,
+            comm_plan=comm_plan,
+            mode=mode,
+            timeout_s=timeout_s,
+            run_rank_0_only_axes=[],
+        )
+        if futures:
+            ray.get(futures)
+
+    def update_parameter_in_bucket(
+        self,
+        payload: dict,
+        ipc_local_ranks: list[int],
+        model_update_transport: str,
+        is_lora: bool = False,
+    ) -> None:
+        """Pass-through: receive a packed weight bucket on IPC-local workers.
+
+        Awaits sub-worker futures so caller ray.get() barriers on weight load completion.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "update_parameter_in_bucket",
+            payload=payload,
+            ipc_local_ranks=ipc_local_ranks,
+            model_update_transport=model_update_transport,
+            is_lora=is_lora,
+            run_rank_0_only_axes=[],
+        )
+        if futures:
+            ray.get(futures)
+
+    def broadcast_parameter(
+        self,
+        group_name: str,
+        names: list[str],
+        dtypes: list,
+        shapes: list,
+        broadcast_local_ranks: list[int],
+        is_lora: bool = False,
+    ) -> None:
+        """Pass-through: receive NCCL broadcast and load weights.
+
+        Awaits sub-worker futures so caller ray.get() barriers on weight load completion.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "broadcast_parameter",
+            group_name=group_name,
+            names=names,
+            dtypes=dtypes,
+            shapes=shapes,
+            broadcast_local_ranks=broadcast_local_ranks,
+            is_lora=is_lora,
+            run_rank_0_only_axes=[],
+        )
+        if futures:
+            ray.get(futures)
+
+    def destroy_collective_group(self, group_name: str) -> None:
+        """Pass-through: destroy NCCL group on all infer workers (no-op for non-members).
+
+        Awaits sub-worker futures so caller ray.get() confirms teardown.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "destroy_collective_group",
+            group_name=group_name,
+            run_rank_0_only_axes=[],
+        )
+        if futures:
+            ray.get(futures)
+
+    def verify_model(self, expected_stats: dict) -> None:
+        """Pass-through: verify weight stats on infer workers."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "verify_model",
+            expected_stats=expected_stats,
+            run_rank_0_only_axes=[],
+        )
+        if futures:
+            ray.get(futures)
+
+    def finalize_weight_update(self) -> None:
+        """Pass-through: run post-load weight processing on all infer workers.
+
+        Awaits sub-worker futures so caller ray.get() confirms finalization.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "finalize_weight_update",
+            run_rank_0_only_axes=[],
+        )
+        if futures:
+            ray.get(futures)
+
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""
         futures = self.worker_group.run_all_workers_single_data("start_gpu_profiling")

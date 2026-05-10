@@ -1113,6 +1113,435 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             post_iter_func=lambda x: x[1],
         )
 
+    # ------------------------------------------------------------------
+    # rlix integration: CPU bucket cache support (Feature 4)
+    # ------------------------------------------------------------------
+    #
+    # Module-level helpers defined immediately below the class are used
+    # by the rlix integration methods.  They are module-level (not class
+    # methods) so they can be tested without constructing a full worker.
+    #
+    # Two-pointer versioning mirrors ROLL megatron_strategy.py:1049–1065:
+    #   build_latest_bucket_cache(v)  — called after train_step; all PP ranks
+    #                                   participate in the collective gather.
+    #   promote_active_checkpoint(v)  — called by BucketCacheLifecycle.promote()
+    #                                   to atomically switch the active pointer.
+    #
+    # selective_sync_active_cache()   — called by ModelUpdateService on the
+    #                                   owner rank to transport buckets to infer
+    #                                   workers (IPC or NCCL per bucket).
+    # ------------------------------------------------------------------
+
+    def _rlix_is_cache_owner(self) -> bool:
+        """Return True only for the single rank that builds/holds the cache."""
+        return (
+            parallel_state.is_pipeline_first_stage()
+            and parallel_state.get_tensor_model_parallel_rank() == 0
+            and parallel_state.get_data_parallel_rank() == 0
+            and parallel_state.get_context_parallel_rank() == 0
+        )
+
+    def _rlix_get_versioned_cache(self):
+        """Lazy-init and return the per-worker VersionedBucketCache."""
+        import threading as _threading
+
+        from rlix.pipeline.bucket_cache import VersionedBucketCache
+
+        if not hasattr(self, "_rlix_versioned_cache"):
+            self._rlix_versioned_cache = VersionedBucketCache()
+            self._rlix_model_update_groups: dict = {}
+            self._rlix_cache_init_lock = _threading.Lock()
+        return self._rlix_versioned_cache
+
+    @torch.no_grad()
+    def build_latest_bucket_cache(self, checkpoint_version: int) -> None:
+        """Gather all HF weights into CPU bucket cache as a new 'latest' version.
+
+        ALL PP/TP/EP ranks must participate simultaneously to keep the Megatron
+        PP collective alive.  Only the cache owner (pp_rank==0, dp_rank==0,
+        tp_rank==0, cp_rank==0) stores the resulting List[BucketRecord].
+        Non-owners drain the generator and return.
+
+        Called by the pipeline after train_step returns.  Equivalent to
+        ROLL worker.py:363 build_latest_bucket_cache.
+
+        Args:
+            checkpoint_version: Step number (or -1 for base model).
+        """
+        import logging
+
+        from rlix.pipeline.bucket_cache import _bucket_named_tensors
+
+        logger = logging.getLogger(__name__)
+        checkpoint_version = int(checkpoint_version)
+        is_owner = self._rlix_is_cache_owner()
+
+        # Ensure refit_conversion_tasks is populated (needed by the iterator).
+        self.prepare_refit_info()
+
+        # Bucket packing: accumulate named tensors until we reach bucket_size_bytes,
+        # then flush a BucketRecord.  Size is read from the worker config (key
+        # "rlix_bucket_size_bytes") or the env var RLIX_BUCKET_SIZE_BYTES.
+        # A hardcoded silent default is intentionally prohibited — callers must set
+        # the config or env var so the value is always visible in logs.
+        bucket_size_bytes: int = _rlix_get_bucket_size_bytes(self)
+        if is_owner and checkpoint_version == -1:
+            # Init-time VRAM check: verify the bucket fits in available GPU memory.
+            _rlix_check_vram(bucket_size_bytes, logger)
+
+        buckets = []
+        current_batch: list = []
+        current_bytes = 0
+
+        for name, tensor in self._iter_params_with_optional_kv_scales():
+            if not is_owner:
+                # Non-owner: must still exhaust the generator to keep the PP
+                # collective alive; do NOT store anything.
+                continue
+
+            cpu_t = tensor.detach().cpu().contiguous()
+            nbytes = cpu_t.numel() * cpu_t.element_size()
+
+            # Fail fast: a single tensor larger than bucket_size_bytes can never be
+            # staged within the GPU VRAM budget (spec: nemorl-port-plan.md line 342-343).
+            # Matches ROLL's send_recv_utils.py assertion pattern.
+            if nbytes > bucket_size_bytes:
+                raise RuntimeError(
+                    f"[rlix] Parameter '{name}' ({nbytes >> 20} MB) exceeds "
+                    f"bucket_size_bytes ({bucket_size_bytes >> 20} MB). "
+                    "Increase RLIX_BUCKET_SIZE_BYTES or bucket_size_bytes config."
+                )
+
+            if current_batch and current_bytes + nbytes > bucket_size_bytes:
+                # Flush current batch into a BucketRecord before appending.
+                buckets.append(_bucket_named_tensors(current_batch))
+                current_batch = []
+                current_bytes = 0
+
+            current_batch.append((name, cpu_t))
+            current_bytes += nbytes
+
+        if is_owner and current_batch:
+            buckets.append(_bucket_named_tensors(current_batch))
+
+        if is_owner:
+            cache = self._rlix_get_versioned_cache()
+            cache.build_latest(checkpoint_version, buckets)
+            total_bytes = sum(b.cpu_uint8_bucket.numel() for b in buckets)
+            logger.info(
+                "[rlix] build_latest_bucket_cache version=%d "
+                "buckets=%d total_bytes=%d",
+                checkpoint_version, len(buckets), total_bytes,
+            )
+            # Host-RAM fail-fast: two-pointer versioning keeps ≤ 2 full model copies.
+            # Check against actual packed model size, not per-bucket size.
+            # Spec: nemorl-port-plan.md line 337 — "估算 total_cpu_cache_bytes … fail fast".
+            if checkpoint_version == -1:
+                try:
+                    import psutil as _psutil
+                    available_ram = _psutil.virtual_memory().available
+                    ram_budget = int(available_ram * 0.8)
+                    two_copy = 2 * total_bytes
+                    if two_copy > ram_budget:
+                        raise RuntimeError(
+                            f"[rlix] Host RAM budget exceeded: "
+                            f"2 × model ({two_copy >> 20} MB) > "
+                            f"80% of available RAM ({ram_budget >> 20} MB). "
+                            "Reduce model size or increase host RAM."
+                        )
+                    logger.info(
+                        "[rlix] host_ram_check_ok two_copy=%d MB available_ram=%d MB",
+                        two_copy >> 20, available_ram >> 20,
+                    )
+                except ImportError:
+                    logger.warning("[rlix] psutil not installed — skipping host-RAM budget check")
+
+    def promote_active_checkpoint(self, version: int) -> None:
+        """Atomically switch the active cache pointer to *version*.
+
+        Non-owner ranks return immediately (no-op).  Only the cache owner
+        (pp_rank==0, dp_rank==0, tp_rank==0, cp_rank==0) has a live cache.
+
+        Called by ``BucketCacheLifecycle.promote()`` after
+        ``build_latest_bucket_cache(version)`` has completed on all workers.
+        Equivalent to ROLL worker.py:387 promote_active_checkpoint.
+
+        Args:
+            version: Must match a version passed to ``build_latest_bucket_cache``.
+        """
+        import logging
+
+        logger = logging.getLogger(__name__)
+        version = int(version)
+
+        if not self._rlix_is_cache_owner():
+            return
+
+        cache = self._rlix_get_versioned_cache()
+        cache.promote(version)
+        logger.info("[rlix] promote_active_checkpoint version=%d", version)
+
+    @torch.no_grad()
+    def selective_sync_active_cache(
+        self,
+        sync_id: str,
+        comm_plan: Optional[dict],
+        tgt_dp_ranks: list[int],
+        tgt_workers: list,
+        tgt_device_mapping: list[int],
+        tgt_num_gpus_per_worker: int,
+        adapters_to_sync: Optional[list[str]] = None,
+        model_update_transport: str = "cpu_serialize",
+    ) -> Optional[dict]:
+        """Transport active cache buckets to inference workers (IPC or NCCL).
+
+        Non-owner ranks return immediately.  Owner holds the cache lock for
+        the entire transport loop to prevent a concurrent promote/build from
+        racing the sender read.
+
+        Per-bucket staging constraint: CPU→GPU one bucket at a time; delete
+        immediately after the barrier.  Forbidden to load the full model to
+        GPU at once.
+
+        Args:
+            sync_id: Unique sync identifier (used for group name lookup).
+            comm_plan: Communication plan built by ModelUpdateService for the
+                owner rank.  Non-owners receive None.
+            tgt_dp_ranks: Inference DP ranks to update.
+            tgt_workers: All inference worker Ray actor handles.
+            tgt_device_mapping: GPU device indices per infer worker.
+            tgt_num_gpus_per_worker: Number of GPUs per infer worker.
+            adapters_to_sync: Unused; reserved for LoRA adapter sync.
+
+        Returns:
+            ``{"weight_stats": {...}}`` from the owner for post-sync
+            verification, or ``None`` from non-owners.
+        """
+        import logging
+
+        import torch.distributed as dist
+
+        logger = logging.getLogger(__name__)
+
+        if not self._rlix_is_cache_owner() or comm_plan is None:
+            return None
+
+        cache = self._rlix_get_versioned_cache()
+        ipc_targets: list[dict] = comm_plan[next(iter(comm_plan))].get("ipc_targets", [])
+        broadcast_local_ranks_by_dp_rank: dict[int, list[int]] = (
+            comm_plan[next(iter(comm_plan))].get("broadcast_local_ranks_by_dp_rank", {})
+        )
+        group_name: str = comm_plan[next(iter(comm_plan))]["group_name"]
+        dp_rank_to_worker = {
+            int(dp_rank): tgt_workers[dp_rank]
+            for dp_rank in tgt_dp_ranks
+        }
+
+        # Hold cache lock for the entire transport to prevent a concurrent
+        # promote/build from modifying the active pointer during transport.
+        with cache._cache_lock:
+            buckets = cache.get_active_buckets()
+            n_buckets = len(buckets)
+
+            for bucket_idx, bucket in enumerate(buckets):
+                # Stage single bucket CPU→GPU; release immediately after barrier.
+                staging_buf: Optional[torch.Tensor] = None
+                try:
+                    staging_buf = bucket.cpu_uint8_bucket.pin_memory().cuda()
+                    logger.info(
+                        "[ModelUpdateService] bucket_send bucket_idx=%d/%d "
+                        "bytes=%d group_name=%s sync_id=%s",
+                        bucket_idx, n_buckets, bucket.used_bytes, group_name, sync_id,
+                    )
+
+                    recv_refs = []
+
+                    # IPC path: colocated same-GPU workers.
+                    # model_update_transport selects the payload format:
+                    # - "cuda_ipc": CUDA IPC handle (zero-copy, same physical GPU).
+                    #   Spec line 316: NCCL CANNOT form a group on the same GPU; IPC is required.
+                    # - "cpu_serialize": CPU uint8 bucket DMA to receiver GPU.
+                    #   Used when CUDA IPC is unavailable (e.g. containerized or cross-GPU).
+                    for ipc_target in ipc_targets:
+                        dp_rank = int(ipc_target["dp_rank"])
+                        local_ranks = ipc_target["local_ranks"]
+
+                        if model_update_transport == "cuda_ipc":
+                            # Zero-copy IPC: share the GPU staging buffer with the colocated process.
+                            from nemo_rl.models.policy.utils import get_handle_from_tensor
+                            torch.cuda.current_stream().synchronize()
+                            cuda_ipc_handle = get_handle_from_tensor(staging_buf)
+                            payload = {
+                                "param_names": bucket.param_names,
+                                "shapes": bucket.shapes,
+                                "dtypes": bucket.dtypes,
+                                "offsets": bucket.offsets,
+                                "used_bytes": bucket.used_bytes,
+                                "cuda_ipc_handle": cuda_ipc_handle,
+                            }
+                        else:
+                            # cpu_serialize: send the CPU uint8 bucket (DMA on receiver side).
+                            payload = {
+                                "param_names": bucket.param_names,
+                                "shapes": bucket.shapes,
+                                "dtypes": bucket.dtypes,
+                                "offsets": bucket.offsets,
+                                "used_bytes": bucket.used_bytes,
+                                "cpu_uint8_bucket": bucket.cpu_uint8_bucket,
+                            }
+
+                        recv_refs.append(
+                            dp_rank_to_worker[dp_rank].update_parameter_in_bucket.remote(
+                                payload, local_ranks, model_update_transport
+                            )
+                        )
+
+                    # NCCL broadcast path: cross-GPU workers.
+                    if group_name in self._rlix_model_update_groups:
+                        nccl_group = self._rlix_model_update_groups[group_name]
+
+                        # Dispatch receiver .remote() calls FIRST, so the
+                        # actor scheduler queues them BEFORE this worker
+                        # blocks on the collective. dist.broadcast() is a
+                        # synchronous NCCL collective — it pins the Python
+                        # thread until every participating rank arrives.
+                        # If we issued .remote() after, the sender thread
+                        # would already be blocked, .remote() would never
+                        # submit, and receivers would never join the
+                        # collective → deadlock.
+                        for dp_rank, broadcast_local_ranks in broadcast_local_ranks_by_dp_rank.items():
+                            recv_refs.append(
+                                dp_rank_to_worker[int(dp_rank)].broadcast_parameter.remote(
+                                    group_name,
+                                    bucket.param_names,
+                                    bucket.dtypes,
+                                    bucket.shapes,
+                                    broadcast_local_ranks,
+                                )
+                            )
+
+                        # Now enter the collective. Receivers' broadcast_parameter
+                        # implementations call group.broadcast(recv_buf, src=0)
+                        # and rendezvous with this call.
+                        dist.broadcast(staging_buf, src=0, group=nccl_group)
+
+                    import ray as _ray
+                    _ray.get(recv_refs)
+
+                    logger.info(
+                        "[ModelUpdateService] bucket_ack bucket_idx=%d/%d sync_id=%s",
+                        bucket_idx, n_buckets, sync_id,
+                    )
+                finally:
+                    # Release GPU staging buffer immediately after barrier.
+                    del staging_buf
+                    staging_buf = None
+
+            # Flush GPU streams before teardown: dist.broadcast is async; synchronize
+            # ensures all NCCL kernels have completed before destroying the communicator.
+            # _ray.get(recv_refs) above already confirmed receivers finished, so this
+            # just ensures sender-side CUDA stream is clean.
+            torch.cuda.synchronize()
+            # Tear down the NCCL collective group while still holding _cache_lock.
+            # Spec (nemorl-port-plan.md line 402): lock must span "cache lookup →
+            # transport → NCCL teardown" — releasing before teardown completes
+            # would allow a concurrent build_latest / promote to race the sender.
+            self.destroy_collective_group(group_name)
+
+        # Compute weight stats for optional post-sync verification.
+        weight_stats: dict = {}
+        try:
+            sd = {n: t for n, t in self._iter_params_with_optional_kv_scales()}
+            vals = [t.float() for t in sd.values() if t.numel() > 0]
+            if vals:
+                all_flat = torch.cat([v.flatten() for v in vals])
+                weight_stats = {
+                    "sum": float(all_flat.sum()),
+                    "max": float(all_flat.max()),
+                    "min": float(all_flat.min()),
+                }
+        except Exception:
+            pass
+
+        return {"weight_stats": weight_stats}
+
+    def setup_collective_group(
+        self,
+        model_update_name: str,
+        comm_plan: dict,
+        mode: str,
+        timeout_s: Optional[float] = None,
+    ) -> None:
+        """Join a dynamic NCCL group for selective model weight broadcast.
+
+        The sender (mode='sender') joins as rank 0; receivers join at
+        their assigned rank from the comm_plan.
+
+        Args:
+            model_update_name: Unique sync identifier (used as group name).
+            comm_plan: Communication plan dict with master_addr/port and
+                world size info.
+            mode: 'sender' (rank 0) or 'receiver'.
+            timeout_s: Optional NCCL init timeout in seconds.
+        """
+        from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
+
+        cache = self._rlix_get_versioned_cache()
+        plan_entry = comm_plan[next(iter(comm_plan))]
+        group_name: str = plan_entry["group_name"]
+        master_addr: str = plan_entry["master_addr"]
+        master_port: int = int(plan_entry["master_port"])
+
+        if mode == "sender":
+            tgt_devices = plan_entry.get("tgt_devices", [])
+            world_size = 1 + len(tgt_devices)
+            rank = 0
+        else:
+            # Receiver: find our rank from tgt_devices list.
+            tgt_devices = plan_entry.get("tgt_devices", [])
+            world_size = 1 + len(tgt_devices)
+            local_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            rank = 1  # default; real multi-receiver assignment handled by StatelessProcessGroup ordering
+            for i, dev in enumerate(tgt_devices):
+                if int(dev.get("rank", -1)) == local_rank:
+                    rank = i + 1
+                    break
+
+        pg = StatelessProcessGroup(
+            master_address=master_addr,
+            port=master_port,
+            rank=rank,
+            world_size=world_size,
+        )
+        pg.init_nccl_communicator(device=self.device if hasattr(self, "device") else torch.device("cuda"))
+        self._rlix_model_update_groups[group_name] = pg
+
+    def destroy_collective_group(self, group_name: str) -> None:
+        """Destroy a dynamic NCCL group created by setup_collective_group.
+
+        No-op if the group does not exist (IPC-only ranks never join the
+        NCCL group, so this guard is required).
+
+        Args:
+            group_name: Group name as used in setup_collective_group.
+        """
+        import logging
+
+        import torch.distributed as dist
+
+        logger = logging.getLogger(__name__)
+        groups = getattr(self, "_rlix_model_update_groups", {})
+        if group_name not in groups:
+            return
+        pg = groups.pop(group_name)
+        try:
+            dist.destroy_process_group(pg)
+        except Exception as exc:
+            logger.warning(
+                "[rlix] destroy_collective_group failed group_name=%s: %s",
+                group_name, exc,
+            )
+
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
@@ -1610,6 +2039,113 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 final_result = obj_list[0]  # type: ignore
 
         return final_result
+
+
+# ---------------------------------------------------------------------------
+# rlix module-level helpers for bucket cache (Feature 4)
+# ---------------------------------------------------------------------------
+# These are module-level so they can be imported and tested without
+# constructing a full MegatronPolicyWorkerImpl.
+# ---------------------------------------------------------------------------
+
+_RLIX_BUCKET_SIZE_ENV = "RLIX_BUCKET_SIZE_BYTES"
+_RLIX_BUCKET_SIZE_DEFAULT = 256 * 1024 * 1024  # 256 MB documented default
+# Transport scratch (NCCL send-side staging overhead estimate).
+_RLIX_TRANSPORT_SCRATCH_MB = 64
+
+
+def _rlix_get_bucket_size_bytes(worker) -> int:
+    """Return the configured bucket size in bytes for rlix cache building.
+
+    Priority order:
+    1. ``worker.cfg["rlix"]["bucket_size_bytes"]`` (explicit config key).
+    2. ``RLIX_BUCKET_SIZE_BYTES`` environment variable.
+    3. Documented default ``_RLIX_BUCKET_SIZE_DEFAULT`` (256 MB), emitted
+       as a WARNING so users know the default is active.
+
+    This function is intentionally NOT a silent fallback — every code path
+    logs the active value so callers are always aware.
+
+    Args:
+        worker: MegatronPolicyWorkerImpl instance (for cfg access).
+
+    Returns:
+        Bucket size in bytes (positive int).
+
+    Raises:
+        ValueError: If the resolved value is <= 0.
+    """
+    import logging
+    import os
+
+    logger = logging.getLogger(__name__)
+
+    # 1. Worker config
+    cfg = getattr(worker, "cfg", {}) or {}
+    rlix_cfg = cfg.get("rlix", {}) or {}
+    if "bucket_size_bytes" in rlix_cfg:
+        val = int(rlix_cfg["bucket_size_bytes"])
+        logger.info("[rlix] bucket_size_bytes=%d (from worker.cfg['rlix'])", val)
+        if val <= 0:
+            raise ValueError(f"[rlix] bucket_size_bytes must be > 0, got {val}")
+        return val
+
+    # 2. Environment variable
+    env_val = os.environ.get(_RLIX_BUCKET_SIZE_ENV)
+    if env_val is not None:
+        val = int(env_val)
+        logger.info("[rlix] bucket_size_bytes=%d (from env %s)", val, _RLIX_BUCKET_SIZE_ENV)
+        if val <= 0:
+            raise ValueError(f"[rlix] {_RLIX_BUCKET_SIZE_ENV} must be > 0, got {val}")
+        return val
+
+    # Spec (nemorl-port-plan.md line 343): bucket_size_bytes must be an explicit
+    # configuration value — no implicit default is allowed.  Fail fast so operators
+    # are forced to make the staging-VRAM budget decision visible in config.
+    raise RuntimeError(
+        "[rlix] bucket_size_bytes is not configured. "
+        f"Set worker.cfg['rlix']['bucket_size_bytes'] or env {_RLIX_BUCKET_SIZE_ENV}. "
+        "No implicit default is permitted (spec: nemorl-port-plan.md line 343)."
+    )
+
+
+def _rlix_check_vram(bucket_size_bytes: int, logger) -> None:
+    """Fail fast if bucket_size_bytes exceeds available GPU VRAM margin.
+
+    Called once at init time (when ``checkpoint_version == -1``).
+    Peak staging VRAM estimate: ``bucket_size_bytes + _RLIX_TRANSPORT_SCRATCH_MB * 1024^2``.
+
+    Args:
+        bucket_size_bytes: Configured bucket size in bytes.
+        logger: Logger instance (already has worker context).
+
+    Raises:
+        RuntimeError: If estimated peak staging VRAM exceeds 90% of free GPU memory.
+    """
+    try:
+        import torch
+
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        scratch_bytes = _RLIX_TRANSPORT_SCRATCH_MB * 1024 * 1024
+        peak_bytes = bucket_size_bytes + scratch_bytes
+        threshold = 0.9 * free_bytes
+        logger.info(
+            "[rlix] vram_check free_gb=%.2f peak_staging_gb=%.2f bucket_size_mb=%d",
+            free_bytes / 1024 ** 3,
+            peak_bytes / 1024 ** 3,
+            bucket_size_bytes // (1024 * 1024),
+        )
+        if peak_bytes > threshold:
+            raise RuntimeError(
+                f"[rlix] bucket_size_bytes={bucket_size_bytes} exceeds VRAM margin: "
+                f"peak_staging={peak_bytes / 1024**3:.2f} GB > 90% of free={free_bytes / 1024**3:.2f} GB. "
+                f"Reduce RLIX_BUCKET_SIZE_BYTES or free GPU memory before training."
+            )
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        # Non-CUDA environments (CPU-only, mock): skip the check.
+        logger.debug("[rlix] vram_check skipped: %s", exc)
 
 
 @ray.remote(
