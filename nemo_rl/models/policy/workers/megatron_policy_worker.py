@@ -1152,7 +1152,20 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
     # ------------------------------------------------------------------
 
     def _rlix_is_cache_owner(self) -> bool:
-        """Return True only for the single rank that builds/holds the cache."""
+        """Return True only for the single rank that builds/holds the cache.
+
+        Tolerant of torn-down Megatron parallel groups: F11's
+        destroy_megatron_nccl_groups() runs after the first selective sync,
+        so the very first scheduler-driven _expand_workers() in rlix mode
+        finds the pp/tp/dp/cp groups uninitialized. Fall back to the global
+        torch rank in that case — correct for TP=PP=DP=CP=1 layouts where
+        only global rank 0 exists.
+        """
+        if not parallel_state.model_parallel_is_initialized():
+            try:
+                return torch.distributed.get_rank() == 0
+            except Exception:
+                return True
         return (
             parallel_state.is_pipeline_first_stage()
             and parallel_state.get_tensor_model_parallel_rank() == 0
@@ -1553,7 +1566,40 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 group_name, exc,
             )
 
+    def _ensure_step_mutex(self) -> None:
+        """Acquire per-GPU Ray mutex if not already held (debug #63 v68).
+
+        The mutex spans the ENTIRE training step (lp_inference → train →
+        offload_after_refit) so the heavy cudaMalloc/Free in ``train()``
+        doesn't disturb the driver pool while another tenant's vLLM tries
+        to ``cuMemMap`` on the same physical GPU.
+        Idempotent: per-step acquire only happens on first call.
+        """
+        if getattr(self, "_gpu_step_mutex_handle", None) is not None:
+            return
+        from nemo_rl.models.gpu_mutex import gpu_mutex_acquire_sync
+        _gpu_id = torch.cuda.current_device()
+        self._gpu_step_mutex_handle = gpu_mutex_acquire_sync(
+            _gpu_id, owner=f"megatron-step-pid{os.getpid()}"
+        )
+
+    def _release_step_mutex(self) -> None:
+        """Release the long-held step mutex if any (debug #63 v68)."""
+        h = getattr(self, "_gpu_step_mutex_handle", None)
+        if h is None:
+            return
+        from nemo_rl.models.gpu_mutex import gpu_mutex_release_sync
+        try:
+            gpu_mutex_release_sync(h)
+        finally:
+            self._gpu_step_mutex_handle = None
+
     def prepare_for_lp_inference(self):
+        # debug #63 v68: acquire long-lived per-GPU mutex spanning the whole
+        # training step. Released in offload_after_refit. This blocks the
+        # other tenant's vLLM wake on the same physical GPU during our
+        # cudaMalloc-heavy reload + train + offload.
+        self._ensure_step_mutex()
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
 
@@ -1576,6 +1622,9 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         torch.cuda.empty_cache()
 
     def prepare_for_training(self, *args, **kwargs):
+        # debug #63 v68: ensure step mutex held (idempotent — already
+        # acquired by prepare_for_lp_inference earlier in the step).
+        self._ensure_step_mutex()
         # onload models and optimizer state to cuda
         self.model = self.move_model(
             self.model, "cuda", move_grads=True, move_params=True
@@ -1638,21 +1687,32 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_after_refit")
     def offload_after_refit(self):
-        """Offload as much as possible on the CPU."""
+        """Offload as much as possible on the CPU.
+
+        debug #63 v68: this is the END of the training step. Release the
+        long-lived per-GPU step mutex acquired in prepare_for_lp_inference
+        AFTER the final synchronize+empty_cache so the driver pool is fully
+        settled before another tenant's vLLM cuMemMap can grab the GPU.
+        """
         no_grad = torch.no_grad()
         no_grad.__enter__()
-        self.model = self.move_model(self.model, "cpu")
-        self.model.eval()
-        torch.randn(1).cuda()  # wake up torch allocator
-        self.offload_before_refit()  # rerun the old offload function
-        self._optimizer_offloaded_for_timesharing = True
+        try:
+            self.model = self.move_model(self.model, "cpu")
+            self.model.eval()
+            torch.randn(1).cuda()  # wake up torch allocator
+            self.offload_before_refit()  # rerun the old offload function
+            self._optimizer_offloaded_for_timesharing = True
 
-        allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
-        reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
-        print(
-            f"GPU Memory after refit complete: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
-        )
-        no_grad.__exit__(None, None, None)
+            allocated = torch.cuda.memory_allocated() / (1024**3)
+            reserved = torch.cuda.memory_reserved() / (1024**3)
+            print(
+                f"GPU Memory after refit complete: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+            )
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        finally:
+            no_grad.__exit__(None, None, None)
+            self._release_step_mutex()
 
     def destroy_nccl_groups(self):
         """Release Megatron NCCL communicator buffers owned by this worker."""
