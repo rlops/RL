@@ -477,6 +477,10 @@ def print_performance_metrics(
         per_worker_token_counts_list = [
             v for k, v in sorted(per_worker_token_counts.items())
         ]
+        # Guard: empty dict or all-zero counts → no tokens were recorded for
+        # this step (e.g. ppl1 ATC interference drains the window). Skip viz.
+        if not per_worker_token_counts_list or max(per_worker_token_counts_list) <= 0:
+            return 0.0
         per_worker_load_ratio = [
             v / max(per_worker_token_counts_list) for v in per_worker_token_counts_list
         ]
