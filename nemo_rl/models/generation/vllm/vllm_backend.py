@@ -445,8 +445,16 @@ class VllmInternalWorkerExtension:
                 flat = buf_gpu[offset : offset + nbytes].view(dtype)
                 weights.append((name, flat.reshape(shape)))
         else:
-            # cpu_serialize: DMA copy pinned CPU buffer → GPU, then unpack
-            buf_gpu = payload["cpu_uint8_bucket"].pin_memory().to(self.device, non_blocking=True)
+            # cpu_serialize: DMA copy pinned CPU buffer → GPU, then unpack.
+            # Sender now ships raw bytes (cross-venv Ray pickle of torch.Tensor
+            # is unreliable); reconstruct here. Fall back to the legacy tensor
+            # field for older senders.
+            if "cpu_uint8_bucket_bytes" in payload:
+                raw = payload["cpu_uint8_bucket_bytes"]
+                buf_cpu = torch.frombuffer(memoryview(raw), dtype=torch.uint8).clone()
+            else:
+                buf_cpu = payload["cpu_uint8_bucket"]
+            buf_gpu = buf_cpu.pin_memory().to(self.device, non_blocking=True)
             torch.cuda.current_stream().synchronize()
 
             record = BucketRecord(

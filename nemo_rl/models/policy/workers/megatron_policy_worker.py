@@ -1399,14 +1399,19 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                                 "cuda_ipc_handle": cuda_ipc_handle,
                             }
                         else:
-                            # cpu_serialize: send the CPU uint8 bucket (DMA on receiver side).
+                            # cpu_serialize: send raw bytes (Ray-stable across venvs).
+                            # Cross-venv torch.Tensor pickling can degrade the
+                            # received object's class (e.g. arrives as list),
+                            # so we pre-serialize on the sender and reconstruct
+                            # on the receiver via torch.frombuffer. Mirrors
+                            # ROLL's serialize_named_weights wire format.
                             payload = {
                                 "param_names": bucket.param_names,
                                 "shapes": bucket.shapes,
                                 "dtypes": bucket.dtypes,
                                 "offsets": bucket.offsets,
                                 "used_bytes": bucket.used_bytes,
-                                "cpu_uint8_bucket": bucket.cpu_uint8_bucket,
+                                "cpu_uint8_bucket_bytes": bucket.cpu_uint8_bucket.numpy().tobytes(),
                             }
 
                         recv_refs.append(
