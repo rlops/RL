@@ -600,6 +600,64 @@ class VllmInternalWorkerExtension:
                     f"expected={expected_stats[key]:.6f} actual={actual[key]:.6f}"
                 )
 
+    def pre_wake_synchronize(self) -> None:
+        """Run ``torch.cuda.synchronize()`` in the GPU worker process BEFORE
+        vLLM's wake_up runs (debug #62).
+
+        Drains any pending CUDA work in this worker's streams. Surfaces any
+        deferred async error from the prior sleep cycle (when sibling tenants
+        on the same physical GPU may have left this process's streams in a
+        non-quiescent state) before vLLM's ``allocator.wake_up`` calls
+        ``cuMemMap`` to re-map physical pages. Without this, deferred
+        async errors often manifest inside ``wake_up`` itself as a CUDA
+        illegal-address fault, masquerading as a wake bug.
+        """
+        torch.cuda.synchronize()
+
+    def pre_sleep_synchronize(self) -> None:
+        """Run ``torch.cuda.synchronize()`` in the GPU worker process BEFORE
+        vLLM's sleep runs (debug #63 v69 — codex root-cause fix).
+
+        vLLM's ``CuMemAllocator.sleep()`` (cumem.py:178) calls
+        ``unmap_and_release(handle)`` (cuMemUnmap + cuMemRelease) on every
+        tracked pointer WITHOUT first synchronizing the CUDA streams. Any
+        kernel or async memcpy still in flight referencing those pool pages
+        will execute against now-released physical memory → silent driver
+        corruption. The corruption surfaces ~3 sleep/wake cycles later as
+        ``CUDA Error: invalid argument`` at ``cumem_allocator.cpp:143``
+        inside the next ``cuMemMap`` call, which makes it look like a wake
+        bug.
+
+        Drain streams here so vLLM's sleep unmaps memory only after the
+        CPU has confirmed all CUDA work is done.
+        """
+        torch.cuda.synchronize()
+
+    def post_sleep_cleanup(self) -> None:
+        """Run ``gc.collect()`` + ``torch.cuda.empty_cache()`` in the GPU worker
+        process (debug #60).
+
+        Background: vLLM's async engine runs the worker (CUDA / CuMemAllocator
+        ownership) in a separate process from the Ray actor. NeMo RL's
+        ``vllm_worker_async.sleep_async`` calls ``gc.collect()`` /
+        ``torch.cuda.empty_cache()`` in the **actor** process, which does not
+        touch the worker process's PyTorch caching allocator pool. Stale unused
+        chunks from PyTorch caching alloc in the worker process can then
+        interleave with vLLM CuMemAllocator-managed VAs at next sleep/wake,
+        producing the deferred ``CUDA error: an illegal memory access`` we hit
+        in v50/v53 under multi-pipeline cross-tenant pressure.
+
+        ROLL avoids this by issuing its post-sleep cleanup from the gpu_worker
+        side (see ROLL ``roll/third_party/vllm/worker.py:534-535``,
+        ``offload_states``: ``gc.collect(); current_platform.empty_cache()``).
+
+        Mirror the same pattern via ``collective_rpc`` from ``sleep_async``.
+        Cheap; safe; idempotent.
+        """
+        import gc as _gc
+        _gc.collect()
+        torch.cuda.empty_cache()
+
     def finalize_weight_update(self) -> None:
         """Run post-loading weight processing (FP8 KV cache, etc.).
 
@@ -608,9 +666,22 @@ class VllmInternalWorkerExtension:
         """
         from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
-        process_weights_after_loading(
-            self.model_runner.model, self.model_config, self.device
-        )
+        # debug #55 (RLix partial-overlap dp=2): post-load processing only on
+        # first call. Subsequent calls happen after vLLM sleep level=2 +
+        # wake_up cycles where registered buffers like _k_scale have stale
+        # GPU pointers; calling set_default_quant_scales(register_buffer=False)
+        # → layer._k_scale.fill_(1.0) writes to freed memory → CUDA
+        # illegal access. For non-quantized models this work is a one-shot
+        # no-op (default scales 1.0). Skip on subsequent calls.
+        # Risk: quantized models may need per-refresh re-processing — when
+        # quantization is configured we still re-run.
+        quantization = getattr(self.model_config, "quantization", None)
+        post_load_done = getattr(self, "_post_load_done", False)
+        if (not post_load_done) or quantization is not None:
+            process_weights_after_loading(
+                self.model_runner.model, self.model_config, self.device
+            )
+            self._post_load_done = True
         self._maybe_process_fp8_kv_cache()
 
     def cleanup(self) -> None:

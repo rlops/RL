@@ -15,10 +15,16 @@
 import asyncio
 import copy
 import gc
+import os
 import threading
 import time
 import uuid
 import warnings
+
+# RLix diagnostic logging — set RLIX_DEBUG=1 to surface per-call sleep/wake
+# telemetry. Off by default to keep production runs out of the multi-MB log
+# regime that v62-v77 needed for active diagnosis.
+_RLIX_DEBUG = bool(os.environ.get("RLIX_DEBUG"))
 from typing import Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -1214,6 +1220,24 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         if level is not None:
             resolved_level = level
 
+        # debug #62 instrumentation: log per-call sleep/wake state to correlate
+        # cross-process timing on the same physical GPU. PIPELINE_ID env is set
+        # by the launcher per pipeline actor. Gated on RLIX_DEBUG=1.
+        import os as _os
+        import time as _time
+        _ppl = _os.environ.get("PIPELINE_ID", "?")
+        if _RLIX_DEBUG:
+            _free, _total = torch.cuda.mem_get_info()
+            print(
+                f"[RLIX_SLEEP_LOG] t={_time.time():.6f} actor_pid={_os.getpid()} "
+                f"ppl={_ppl} dev={torch.cuda.current_device()} level={resolved_level} mode={mode} "
+                f"phase=enter gpu_free_GiB={_free/1024**3:.3f} "
+                f"gpu_used_GiB={(_total-_free)/1024**3:.3f}",
+                flush=True,
+            )
+        else:
+            _free = _total = 0
+
         # Reset the prefix cache to ensure that prefix cache is not reused after weights are updated
         await self.llm.reset_prefix_cache()
         # Reset the multimodal processor cache (sender side) so it stays in
@@ -1222,7 +1246,51 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         # the receiver and sends data=None, causing an assertion error.
         if hasattr(self.llm, "reset_mm_cache"):
             await self.llm.reset_mm_cache()
-        await self.llm.sleep(level=resolved_level, mode=mode)
+        # debug #63 v65: Ray-actor-based per-GPU mutex to serialize
+        # cuMemUnmap (sleep) across processes on this physical GPU. fcntl
+        # (v62-v64) couldn't reliably serialize EngineCore subprocesses; the
+        # Ray mutex works across all Ray actors regardless of process model.
+        from nemo_rl.models.gpu_mutex import get_gpu_mutex
+        _sleep_gpu_id = torch.cuda.current_device()
+        _sleep_mutex = get_gpu_mutex(_sleep_gpu_id)
+        await _sleep_mutex.acquire.remote(f"vllm-sleep-pid{_os.getpid()}")
+        try:
+            # debug #63 v69 (codex root-cause fix): drain CUDA streams in the
+            # WORKER process before vLLM's sleep calls cuMemUnmap. Without
+            # this, async kernels in flight on the kv_cache pool race with
+            # the unmap, producing silent driver corruption that surfaces
+            # ~3 cycles later as cuMemMap "invalid argument".
+            try:
+                await self.llm.collective_rpc("pre_sleep_synchronize")
+            except Exception as exc:
+                print(f"pre_sleep_synchronize failed (continuing): {exc!r}")
+            await self.llm.sleep(level=resolved_level, mode=mode)
+        finally:
+            await _sleep_mutex.release.remote()
+        if _RLIX_DEBUG:
+            _free2, _total2 = torch.cuda.mem_get_info()
+            print(
+                f"[RLIX_SLEEP_LOG] t={_time.time():.6f} actor_pid={_os.getpid()} "
+                f"ppl={_ppl} dev={torch.cuda.current_device()} level={resolved_level} "
+                f"phase=after_vllm_sleep gpu_free_GiB={_free2/1024**3:.3f} "
+                f"gpu_used_GiB={(_total2-_free2)/1024**3:.3f} "
+                f"freed_GiB={(_free2-_free)/1024**3:.3f}",
+                flush=True,
+            )
+
+        # debug #60: run gc.collect() + torch.cuda.empty_cache() in the GPU
+        # *worker* process (not just this actor process) — see ROLL
+        # `roll/third_party/vllm/worker.py:534-535` `offload_states`. The
+        # actor-side empty_cache below does not touch the worker process's
+        # PyTorch caching allocator pool, which retains stale unused chunks
+        # that interleave with vLLM CuMemAllocator-managed VAs and cause
+        # deferred CUDA illegal-address faults at the next sleep/wake under
+        # cross-tenant GPU pressure (RLix multi-pipeline partial-overlap).
+        # Best-effort: failure falls through to actor-side cleanup.
+        try:
+            await self.llm.collective_rpc("post_sleep_cleanup")
+        except Exception as exc:
+            print(f"post_sleep_cleanup failed (continuing): {exc!r}")
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -1244,13 +1312,115 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         if tags is not None:
             wake_up_args["tags"] = tags
 
-        await self.llm.wake_up(**wake_up_args)
+        # debug #62 instrumentation — gated on RLIX_DEBUG=1
+        import os as _os
+        import time as _time
+        _ppl = _os.environ.get("PIPELINE_ID", "?")
+        if _RLIX_DEBUG:
+            _free, _total = torch.cuda.mem_get_info()
+            print(
+                f"[RLIX_WAKE_LOG] t={_time.time():.6f} actor_pid={_os.getpid()} "
+                f"ppl={_ppl} dev={torch.cuda.current_device()} tags={tags} phase=enter "
+                f"gpu_free_GiB={_free/1024**3:.3f} "
+                f"gpu_used_GiB={(_total-_free)/1024**3:.3f}",
+                flush=True,
+            )
+
+        # debug #63: γ band-aid (pre-wake 200ms settle) was reverted because
+        # codex Q5 review identified the correct fix as the RELEASE side
+        # (post-synchronize torch.cuda.empty_cache() in MegatronPolicyWorker.
+        # offload_after_refit). The wake-side delay is non-causal and only
+        # masks the race; the release-side empty_cache ensures the driver
+        # pool is fully settled before the scheduler grant.
+
+        # debug #62: Drain pending CUDA work in the *worker* process before
+        # vLLM's allocator.wake_up runs cuMemMap. Surfaces any deferred async
+        # error from the prior sleep cycle here (deterministic, not hidden as
+        # a wake-up bug). Mirror of ROLL's implicit synchronization between
+        # phases via blocking collective_rpc dispatch. Best-effort.
+        try:
+            await self.llm.collective_rpc("pre_wake_synchronize")
+        except Exception as exc:
+            print(f"pre_wake_synchronize failed (continuing): {exc!r}")
+
+        # debug #58 / F-2: the rebind_sleep_saved_buffers_to_pytorch_alloc
+        # defence was removed once the v73 root-cause fix (pre_sleep_synchronize
+        # + atomic single wake_up + per-GPU mutex) eliminated the VA-poisoning
+        # race that rebind was working around. v79 validated removal had no
+        # regression. See REVIEW_FINDINGS.md F-2/F-7.
+
+        # debug #63 v73: Eliminated split-wake (weights then kv_cache as two
+        # separate tagged wake_up calls with mutex release in between).
+        #
+        # ROOT CAUSE of the cuMemMap "invalid argument" crash at step 3+:
+        # CuMemAllocator.wake_up() was designed to be called once per sleep/wake
+        # cycle. Splitting it into two tagged calls (weights, then kv_cache)
+        # with a mutex release between them creates a non-atomic remap sequence:
+        #
+        #   1. weights wake_up() → cuMemMap on weights pool handles (OK)
+        #   2. mutex released ← gap: another pipeline can sleep() here
+        #   3. kv_cache wake_up() → cuMemMap on kv_cache handles (CRASH)
+        #
+        # After 3+ cycles, the CuMemAllocator's internal pointer_to_data /
+        # handle_to_data bookkeeping accumulates subtle inconsistencies from
+        # this non-atomic pattern, causing cuMemMap to receive a stale/released
+        # physical handle → "invalid argument" (not OOM, not out of VA space).
+        #
+        # Fix: one mutex acquisition, one untagged wake_up() (both pools in a
+        # single atomic call), then synchronize before releasing the mutex.
+        # If the caller passed explicit tags, honor them (existing behavior).
+        from nemo_rl.models.gpu_mutex import get_gpu_mutex
+        _wake_gpu_id = torch.cuda.current_device()
+        _wake_mutex = get_gpu_mutex(_wake_gpu_id)
+        _wake_owner = f"vllm-wake-pid{_os.getpid()}"
+        _t0 = _time.time()
+        await _wake_mutex.acquire.remote(_wake_owner + "/wake")
+        try:
+            await self.llm.wake_up(**wake_up_args)
+            # Drain CUDA streams in the worker process after all pool remaps
+            # complete. This ensures any deferred async work that referenced
+            # the just-remapped VA ranges is confirmed complete before the
+            # mutex is released, preventing the next pipeline's sleep() from
+            # racing with stale async work.
+            try:
+                await self.llm.collective_rpc("pre_wake_synchronize")
+            except Exception as exc:
+                print(f"post-wake-sync failed (continuing): {exc!r}")
+        finally:
+            await _wake_mutex.release.remote()
+        if _RLIX_DEBUG:
+            _free_c, _total_c = torch.cuda.mem_get_info()
+            print(
+                f"[RLIX_WAKE_LOG] t={_time.time():.6f} actor_pid={_os.getpid()} "
+                f"ppl={_ppl} dev={torch.cuda.current_device()} phase=after_wake "
+                f"tags={tags} elapsed_ms={(_time.time()-_t0)*1000:.1f} "
+                f"gpu_free_GiB={_free_c/1024**3:.3f} "
+                f"gpu_used_GiB={(_total_c-_free_c)/1024**3:.3f}",
+                flush=True,
+            )
 
     async def shutdown(self) -> bool:
-        """Clean up vLLM resources."""
+        """Clean up vLLM resources.
+
+        debug #63 v71: acquire per-GPU mutex during shutdown so vLLM teardown
+        (which can call cuMemUnmap/cuMemRelease on cumem pool) doesn't race
+        with another tenant's still-running wake_up on the same physical GPU.
+        Without this, the v69/v70 cascade pattern triggers: ppl1 finishes
+        first → shutdown unmaps GPU memory → ppl2's next wake_up cuMemMap
+        finds invalid handle.
+        """
+        from nemo_rl.models.gpu_mutex import get_gpu_mutex
+        import os as _os
+        _gpu_id = torch.cuda.current_device()
+        _shutdown_mutex = get_gpu_mutex(_gpu_id)
+        await _shutdown_mutex.acquire.remote(f"vllm-shutdown-pid{_os.getpid()}")
         try:
             if self.llm is not None:
                 # Clean up extension resources (e.g., ZMQ sockets)
+                try:
+                    await self.llm.collective_rpc("pre_sleep_synchronize")
+                except Exception as exc:
+                    print(f"pre_shutdown_synchronize failed (continuing): {exc!r}")
                 await self.llm.collective_rpc("cleanup", args=tuple())
                 try:
                     self.llm.shutdown()
@@ -1266,7 +1436,12 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             # Force garbage collection
             gc.collect()
             torch.cuda.empty_cache()
-
+        finally:
+            try:
+                await _shutdown_mutex.release.remote()
+            except Exception:
+                pass
+        try:
             if self.server_thread is not None:
                 from threading import Thread
 
