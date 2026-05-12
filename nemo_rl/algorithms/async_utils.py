@@ -373,6 +373,21 @@ class AsyncTrajectoryCollector:
         else:
             print(f"🔄 Updated weight version to {version}")
 
+    def set_active_dp_ranks(self, ranks: list[int]) -> None:
+        # ATC owns a pickled snapshot of VllmGeneration; routing decisions read
+        # _active_dp_ranks locally. Pipeline-side activate_dp_ranks/sleep_all
+        # updates do not propagate, so the rlix pipeline must push the new set
+        # whenever it expands or shrinks routing.
+        pg = self.policy_generation
+        lock = getattr(pg, "_active_dp_ranks_lock", None)
+        new_set = {int(r) for r in ranks}
+        if lock is not None:
+            with lock:
+                pg._active_dp_ranks = set(new_set)
+        else:
+            pg._active_dp_ranks = set(new_set)
+        print(f"🛣️ ATC routing updated: active_dp_ranks={sorted(new_set)}")
+
     def begin_progress_batch(self, step: int, count_intended: int) -> None:
         """Start reporting progress for the training step RLix is scheduling.
 

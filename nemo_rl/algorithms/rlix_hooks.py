@@ -33,19 +33,31 @@ class RLixHooksProtocol(Protocol):
         """
         ...
 
-    def after_training(self, step: int) -> int | None:
-        """Called after policy.train() completes; notifies scheduler to expand.
+    def before_weight_sync(self, step: int) -> None:
+        """Called immediately after policy.train() and BEFORE policy.offload_after_refit().
 
-        F5: in RLix mode, notifies the scheduler that actor_train GPUs are
-        released.  The scheduler asynchronously calls coordinator.resize_infer
-        (add=overlap_ranks), which routes to pipeline._expand_workers() (F6).
-        Weight sync and version update happen inside _expand_workers.
+        F4: RLix builds the CPU bucket cache here while the freshly-updated
+        Megatron parameters are still resident on GPU. Doing this after
+        offload_after_refit() would observe zero-storage tensors (debug #34)
+        because that call swaps .data with empty storage to release VRAM.
+
         In standalone mode, this is a no-op.
+        """
+        ...
+
+    def after_training(self, step: int) -> int | None:
+        """Called after grpo.py's offload_after_refit + destroy_megatron_nccl_groups.
+
+        F5: in RLix mode, drives the post-train half of weight sync — pushes the
+        cached weights to active inference workers (coordinator.sync_base_weights_to_active)
+        and publishes the new weight version to ATC. The scheduler asynchronously
+        calls coordinator.resize_infer (add=overlap_ranks), which routes to
+        pipeline._expand_workers() (F6).  In standalone mode, this is a no-op.
 
         Preconditions (must be satisfied before calling in RLix mode):
-            - CPU bucket cache built (TODO F4: policy.build_cpu_bucket_cache)
-            - Training GPU VRAM offloaded (TODO F11: policy.offload_training_gpu)
-            - Megatron NCCL groups destroyed (F11: destroy_megatron_nccl_groups)
+            - CPU bucket cache built  (handled by before_weight_sync)
+            - Training GPU VRAM offloaded (grpo.py:policy.offload_after_refit)
+            - Megatron NCCL groups destroyed (grpo.py:destroy_megatron_nccl_groups)
         """
         ...
 
@@ -99,6 +111,9 @@ class NoOpRLixHooks:
     """
 
     def before_training(self, step: int) -> None:
+        pass
+
+    def before_weight_sync(self, step: int) -> None:
         pass
 
     def after_training(self, step: int) -> int | None:

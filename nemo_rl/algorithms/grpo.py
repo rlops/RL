@@ -749,7 +749,13 @@ def setup(
     policy.print_node_ip_and_gpu_id()
 
     # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference:
+    # RLix mode owns weight sync via NemoRLModelUpdateService.sync_selected_workers
+    # which uses model_update_transport="cpu_serialize" (no NCCL). Skip the static
+    # model_update_group init: with partial-overlap topology (vLLM rank co-located
+    # on the same physical GPU as a Megatron rank) NCCL refuses comm_init_rank_scalable
+    # with InvalidUsage(5). cf. debug_log #43, plan F4.
+    _rlix_mode = os.environ.get("RLIX_CONTROL_PLANE") == "rlix"
+    if not colocated_inference and not _rlix_mode:
         t0 = time.perf_counter()
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
@@ -767,6 +773,12 @@ def setup(
         # wait for all futures to complete
         ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
+    elif _rlix_mode and not colocated_inference:
+        print(
+            "  ⚙️  RLix mode: skipping static model_update_group NCCL init "
+            "(weight sync uses cpu_serialize transport via NemoRLModelUpdateService)",
+            flush=True,
+        )
 
     # prepare refit info
     state_dict_info = policy.prepare_refit_info()
@@ -2940,6 +2952,12 @@ def async_grpo_train(
                     # wake + selective sync + version update + routing activation (F6).
                     #
                     with timer.time("weight_sync"):
+                        # F4 (RLix): snapshot the freshly-trained weights into
+                        # the CPU bucket cache BEFORE offload_after_refit swaps
+                        # parameter storage with empty tensors. NoOp in
+                        # standalone mode.
+                        hooks.before_weight_sync(step)
+
                         # F11: PR #4 owns the Megatron NCCL destroy/reload
                         # implementation. This branch only invokes it after
                         # NeMo has offloaded training-side state.
