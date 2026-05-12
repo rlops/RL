@@ -806,12 +806,13 @@ class VllmGeneration(GenerationInterface):
                     f"Cannot sleep inactive DP shards: {inactive_dp_ranks}"
                 )
 
-            remaining_active_dp_ranks = self._active_dp_ranks.difference(
-                target_dp_ranks
-            )
-            if not remaining_active_dp_ranks:
-                return False
-
+            # debug #57 (RLix v50): empty-active-set guard removed. Plan F2
+            # gating ("non-overlap shard never globally pauses") is a scheduler
+            # policy concern, not an API invariant. Forcing rlix _shrink_workers
+            # to fall back to sleep_all introduced the wake-after-sleep_all CUDA
+            # bug (debug #55). Callers that previously relied on the False
+            # return for "would empty active" now get an actual sleep instead;
+            # they must enforce the policy at the scheduler layer if needed.
             self._active_dp_ranks.difference_update(target_dp_ranks)
 
         if mark_preempted:
